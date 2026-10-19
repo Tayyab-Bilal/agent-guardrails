@@ -10,7 +10,7 @@ from .gatekeeper import Action, guard
 from .outcome import RunOutcome
 from .permissions import PermissionSource
 from .replay import execute_draft
-from .resolver import WRITE_TOOLS, READ_TOOLS, TOOL_ACTIONS
+from .resolver import READ_TOOLS, TOOL_ACTIONS, WRITE_TOOLS
 
 
 def unclassified_tools(tools: Sequence[StructuredTool]) -> list[str]:
