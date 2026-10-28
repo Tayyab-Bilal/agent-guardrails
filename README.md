@@ -6,6 +6,54 @@ Deterministic permissions and human-in-the-loop approval for LLM agents: the mod
 
 [![CI](https://github.com/Tayyab-Bilal/agent-guardrails/actions/workflows/ci.yml/badge.svg)](https://github.com/Tayyab-Bilal/agent-guardrails/actions/workflows/ci.yml)
 
+## At a glance
+
+**What it is.** A small Python library that sits between an LLM agent and its write tools. Code, not the model, decides if each write runs now, waits for a human, or is refused.
+
+**What is built** (in this repo, working and tested):
+
+- Wrap write tools so every call is checked first: `src/agent_guardrails/gate.py: guard_tools()`
+- Decide run / hold / block for one call, and an existing human answer wins: `src/agent_guardrails/gatekeeper.py: guard()`
+- Map each tool to a permission action, deny anything unmapped: `src/agent_guardrails/resolver.py: mode_for()`
+- Read the three modes (Autonomous, Suggest Only, Disabled) fresh on every call: `src/agent_guardrails/permissions.py: load_permissions()`
+- Tell "service down" and "bad config" apart from "disabled": `src/agent_guardrails/gatekeeper.py: _load()`
+- Store drafts, one per exact action, with a signature over the arguments: `src/agent_guardrails/drafts.py: DraftStore`
+- Write the approval sentence with names instead of ids, with capped lookups: `src/agent_guardrails/describe.py: DeterministicDescriber`, `src/agent_guardrails/resolve.py: resolve_names()`
+- Park the run, emit an event, settle all drafts in one call (a second call gets 409): `src/agent_guardrails/runs.py: RunManager.finish()`, `RunManager.decide()`
+- Run approved drafts from the stored arguments, exactly once: `src/agent_guardrails/replay.py: execute_draft()`
+- Run autonomous writes exactly once with a ledger row claimed first: `src/agent_guardrails/drafts.py: begin_autonomous()`
+- Record blocked, held and executed steps in code, not by the model: `src/agent_guardrails/outcome.py: RunOutcome`
+
+**What is not built / simplified here:**
+
+- The permissions service is simulated. There is a static source, a file source, and an HTTP source that takes an injected `get_json`. No real service is called.
+- Storage is one SQLite connection behind a lock. Many workers would need Postgres.
+- The tools and backend are a fictional in-memory app (`acme_tools.py`).
+- The event sink is an in-memory list. Nothing posts a webhook and there is no approval UI.
+- It is not a sandbox. Only the tool copies from `guard_tools` are gated.
+- A crashed `executing` row needs a human to look at it. A parked run has no built-in resume trigger.
+- The mutation budget (default 150) is in memory and per `guard_tools` call.
+- Tests use fake LLMs. No network, no API keys.
+
+**How a write flows:**
+
+1. The agent calls a guarded tool. The wrapper in `gate.py: guard_tools()` calls `gatekeeper.py: guard()` before anything runs.
+2. `guard()` looks for a draft for this exact action (`idempotency.py: idempotency_key()`). If a human already answered, that answer wins.
+3. With no draft, `resolver.py: TOOL_ACTIONS` blocks unmapped tools. Otherwise `permissions.py: load_permissions()` fetches the mode and `resolver.py: mode_for()` reads it.
+4. Autonomous: `drafts.py: begin_autonomous()` claims a ledger row, then the real tool runs. Suggest Only: `drafts.py: create_pending()` stores a draft, with a sentence from `describe.py: DeterministicDescriber.describe()`. Disabled: the call is refused.
+5. When the agent stops, `runs.py: RunManager.finish()` parks the run as `awaiting_approval` and emits one event.
+6. A human answers with one `runs.py: RunManager.decide()` call. It claims the run with a conditional UPDATE, so a second call gets 409.
+7. `replay.py: replay_approved()` runs each approved draft from its stored arguments, after `execute_draft()` claims it and checks the signature.
+
+**Run it:**
+
+```bash
+uv venv .venv && uv pip install -e ".[dev]"
+.venv/bin/pytest -q
+```
+
+Current result: 95 passed in about 2 seconds. For the story end to end: `.venv/bin/python examples/demo.py`.
+
 ## The problem
 
 An autonomous agent runs at 3 a.m. with nobody watching. If the model calls `delete_project`,
@@ -144,7 +192,7 @@ sequenceDiagram
     U->>S: existing draft for this exact action?
     alt Autonomous
         U-->>G: EXECUTE
-        G->>S: ledger row "executing" (unique key; loser stops)
+        G->>S: ledger row "executing" (unique key, loser stops)
         G->>T: run
         G->>S: mark posted / failed (failed can be claimed again)
     else Suggest Only
