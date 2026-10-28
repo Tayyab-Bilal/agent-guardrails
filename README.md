@@ -54,6 +54,83 @@ uv venv .venv && uv pip install -e ".[dev]"
 
 Current result: 95 passed in about 2 seconds. For the story end to end: `.venv/bin/python examples/demo.py`.
 
+## How each part works, one by one
+
+### 1. The tool-to-permission map, deny by default
+
+- **Risk / problem:** The model can call a tool nobody planned for, or a destructive tool that sounds close to an allowed one. If the code guesses, a tenant who allowed edits ends up allowing deletes.
+- **How it works:**
+  - A fixed table ties each write tool to exactly one named permission action. The model cannot change this table, only code can.
+  - Destructive tools such as deleting a project are listed on purpose as denied. They are never mapped to a "nearby" action, because allowing edits never meant allowing deletion (`resolver.py: TOOL_ACTIONS`, `resolver.py: ALLOWED_UNGATED`).
+  - Anything not in the table is refused before any permission lookup is made. A missing action, an empty config or a mode name nobody recognises all read as Disabled (`resolver.py: mode_for()`, `resolver.py: canonical_permissions()`).
+  - Read tools pass through because they sit on an explicit read list. Every tool must be in one of three lists, so a brand new tool cannot slip through unnoticed.
+  - Wiring fails closed: if a tool is in none of the lists, setup raises an error instead of running it silently (`gate.py: guard_tools()`).
+- **Tests that prove it:** `tests/test_resolver.py`: `test_unmapped_tool_is_denied`, `test_invented_tool_is_denied`, `test_empty_config_denies_everything`, and `test_unknown_mode_string_denies`, `test_new_unclassified_tool_is_caught_and_refused` as well. Also `tests/test_gatekeeper.py`: `test_attacker_text_in_args_cannot_raise_autonomy`.
+
+### 2. Permission modes, read fresh every call
+
+- **Risk / problem:** If permissions are cached, a tenant who switches an action to Disabled still sees it run. If the model could influence the mode, it could talk its way into more freedom.
+- **How it works:**
+  - Each action has one of three modes: Autonomous (run now), Suggest Only (hold for a human) or Disabled (refuse).
+  - The mode is fetched again on every single gated call, so a settings change takes effect on the very next call (`permissions.py: load_permissions()`).
+  - The decision is a plain lookup on the tool name and the tenant config. The arguments the model sends are never used to pick a mode, so text hidden in a field is just text (`gatekeeper.py: guard()`).
+  - The source of permissions is swappable: a fixed dict, a file, or an HTTP call through an injected function. The real service is simulated here (`permissions.py: StaticPermissionSource`).
+- **Tests that prove it:** `tests/test_gatekeeper.py`: `test_tool_arguments_cannot_change_the_gate`, `test_attacker_text_in_args_cannot_raise_autonomy`, `test_existing_draft_wins_over_mode_change`. `tests/test_permissions.py`: `test_file_source_reads_fresh_and_flags_bad_json`.
+
+### 3. Idempotency key and drafts
+
+- **Risk / problem:** The model retries, rephrases or repeats a call. Without a stable identity for "this exact action" you get duplicate approvals, or one approval reused on a different target.
+- **How it works:**
+  - Arguments are cleaned into one standard form first: empty values dropped, keys sorted, and a number written as text treated the same as the number. So harmless noise does not create a "new" action.
+  - The key is a hash of the run, the tool and those cleaned arguments. Same action in the same run gives the same key, and a different target gives a different key, so approving one task never approves another (`idempotency.py: idempotency_key()`).
+  - A draft is a stored row for one held action, unique on run plus key. Asking twice returns the same draft instead of making a second one (`drafts.py: DraftStore.create_pending()`).
+  - The draft keeps the original arguments and a signature over them, made with a secret key. Any edit to the stored text breaks the signature (`drafts.py: DraftStore.verify()`).
+  - Simplification: a zero-padded id like "007" is treated as 7, which is noted as a known trade-off.
+- **Tests that prove it:** `tests/test_idempotency.py`: `test_arg_noise_maps_to_same_key`, `test_real_differences_change_the_key`. `tests/test_gatekeeper.py`: `test_same_call_twice_does_not_duplicate_draft`, `test_different_target_needs_new_approval`.
+
+### 4. Exactly-once ledger and claim
+
+- **Risk / problem:** Two workers, a retry or a restart can run the same write twice. Charging twice or emailing twice is worse than doing nothing.
+- **How it works:**
+  - Before an autonomous write runs, the code first inserts a ledger row marked "executing". The database allows only one row per action, so only one caller wins and the loser does nothing (`drafts.py: DraftStore.begin_autonomous()`).
+  - Approved drafts work the same way: the move from approved to executing is one conditional update, and only the caller that changed the row may run the tool (`drafts.py: DraftStore.claim()`).
+  - If the process crashes mid-write, the row stays "executing" and is never re-run, because the effect may already have happened. A human has to check it. Simplification: there is no automatic repair, only a list of stuck rows (`drafts.py: DraftStore.list_stuck()`).
+  - If a write fails cleanly, it is marked failed and may be claimed again, but only if the policy still says Autonomous.
+  - There is also a cap on writes per run, 150 by default. Calls that lose a race or are blocked do not count (`gate.py: guard_tools()`).
+- **Tests that prove it:** `tests/test_gatekeeper.py`: `test_concurrent_identical_autonomous_calls_run_once`, `test_crash_mid_autonomous_write_is_not_rerun_on_resume`, `test_failed_reclaim_is_atomic_only_one_retry_wins`, and others on retries and the budget. `tests/test_replay.py`: `test_concurrent_replays_execute_exactly_once`, `test_claim_is_atomic_across_threads`, `test_crash_mid_execution_is_not_rerun`.
+
+### 5. Park the run, one decision, replay
+
+- **Risk / problem:** A human answers hours later, maybe from another process, with many drafts waiting. Per-draft answers can leave a run half done, and two reviewers can race.
+- **How it works:**
+  - When the agent stops with drafts still pending, the run is parked as "awaiting approval" and one event listing every draft is emitted. The event goes to an in-memory list here, not a real webhook (`runs.py: RunManager.finish()`).
+  - One decide call must answer exactly the pending drafts, no more and no fewer. A mismatch is rejected and the run goes back to waiting (`runs.py: RunManager.decide()`).
+  - The call first claims the run with one conditional update. A second or simultaneous call finds the run already claimed and gets a 409 conflict.
+  - Approved drafts then run from the stored arguments, never from a fresh model answer, and the signature is checked first. The arguments are also validated against the tool's schema again. Rejected drafts never run (`replay.py: execute_draft()`).
+- **Tests that prove it:** `tests/test_runs.py`: `test_second_decision_gets_conflict_409`, `test_concurrent_decisions_exactly_one_wins`, `test_decisions_must_cover_exactly_the_pending_drafts_and_release_the_claim`, and 6 more in that file. `tests/test_replay.py`: `test_replay_uses_stored_args_not_new_llm_args`, `test_edited_stored_args_without_key_refuses_to_run`, `test_stored_args_are_revalidated_against_tool_schema`, and 16 more in that file.
+
+### 6. Unavailable versus misconfigured versus disabled
+
+- **Risk / problem:** If a failed permissions lookup is reported as "disabled", users go and check settings that were fine. Worse, a broken lookup might be treated as "allowed".
+- **How it works:**
+  - Errors that look temporary, such as a timeout, are retried twice with growing pauses. If they keep failing the answer is "unavailable": nothing runs, and the run is parked so it can resume later (`failure.py: run_with_retry()`).
+  - Errors that will not fix themselves, such as a bad payload or an unreadable file, are "misconfigured". These are not retried and the real cause is shown.
+  - The payload shape is checked before it is trusted. Anything off is misconfigured, never quietly treated as a mode (`permissions.py: _validate()`).
+  - Neither case is ever worded as "disabled", and neither runs the write. Only a real Disabled mode says the organisation turned it off (`gatekeeper.py: _load()`).
+- **Tests that prove it:** `tests/test_permissions.py`: `test_unavailable_is_retried_then_parked_never_reported_as_disabled`, `test_misconfigured_is_terminal_with_the_real_cause_and_not_retried`, `test_transient_error_that_recovers_runs_the_write`, and 7 more in that file. `tests/test_runs.py`: `test_all_blocked_run_finishes_failed_and_outage_finishes_parked`.
+
+### 7. The coverage test for unmapped write tools
+
+- **Risk / problem:** Someone adds a new write tool next month and forgets to classify it. It would then run with no policy, and nobody notices.
+- **How it works:**
+  - There are three lists: mapped write tools, deliberately denied write tools, and read tools. A tool must be in exactly one of them.
+  - A test builds the real tool set and fails in CI if any tool is in none of the lists, or in two of them. A new tool cannot be merged until someone decides what it is (`gate.py: unclassified_tools()`).
+  - The same check runs at wiring time, so a missing tool fails at startup instead of at the first call (`gate.py: guard_tools()`).
+  - Even if it somehow got past both, an unknown tool name is refused at call time.
+- **Tests that prove it:** `tests/test_resolver.py`: `test_every_mutating_tool_is_mapped_or_explicitly_denied`, `test_new_unclassified_tool_is_caught_and_refused`, `test_unmapped_tool_is_denied`.
+
+See also the older [What it does](#what-it-does) and [Design decisions](#design-decisions) sections, which are the short versions of this.
+
 ## The problem
 
 An autonomous agent runs at 3 a.m. with nobody watching. If the model calls `delete_project`,
